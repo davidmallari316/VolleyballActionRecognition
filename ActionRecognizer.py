@@ -1,5 +1,13 @@
+import os
+
 import torch
-import torch.nn as nn
+from torchvision.io import write_png
+from torchvision.models.detection import (
+    fasterrcnn_resnet50_fpn,
+    FasterRCNN_ResNet50_FPN_Weights,
+)
+from torchvision.utils import draw_bounding_boxes
+from torchcodec.decoders import VideoDecoder
 from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights
 
 
@@ -20,71 +28,93 @@ class ActionRecognizer:
         self.transform = self.weights.transforms()
         self.categories = self.weights.meta["categories"]
 
+        # Person detector used to localize the action (the classifier has no boxes).
+        det_weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+        self.detector = fasterrcnn_resnet50_fpn(weights=det_weights)
+        self.detector.eval().to(self.device)
+        self.person_id = det_weights.meta["categories"].index("person")
+
     @torch.no_grad()
-    def predict(self, clip):
+    def _person_box(self, frame, min_score=0.5):
+        """Union box (x1, y1, x2, y2) of all people in a (C, H, W) uint8 frame, or None."""
+        det = self.detector([frame.float().div(255).to(self.device)])[0]
+        keep = (det["labels"] == self.person_id) & (det["scores"] >= min_score)
+        boxes = det["boxes"][keep]
+        if len(boxes) == 0:
+            return None
+        return (
+            boxes[:, 0].min().item(), boxes[:, 1].min().item(),
+            boxes[:, 2].max().item(), boxes[:, 3].max().item(),
+        )
+
+    @torch.no_grad()
+    def predict(self, frames):
         """
         Classify a single video clip.
 
         Args:
-            clip: uint8 tensor of shape (T, H, W, C) or (C, T, H, W),
-                  with T frames. Frames should be RGB.
+            frames: uint8 tensor of shape (T, C, H, W), RGB, as TorchCodec returns.
 
         Returns:
-            List of (label, probability) tuples, highest first.
+            List of (label, probability, box) tuples, highest first. box is
+            (x1, y1, x2, y2) in original frame pixels around the people in the
+            clip's middle frame, or None if no one was detected.
         """
-        clip = self._to_tchw(clip)
-        clip = self.transform(clip).unsqueeze(0).to(self.device)  # (1, C, T, H, W)
+        # The transform takes (T, C, H, W) and returns (C, T, H, W).
+        clip = self.transform(frames).unsqueeze(0).to(self.device)  
 
         logits = self.model(clip)
         probs = logits.softmax(dim=1)[0]
 
         values, indices = probs.topk(self.top_k)
-        return [(self.categories[i], v.item()) for v, i in zip(values, indices)]
+        box = self._person_box(frames[len(frames) // 2])
+        return [(self.categories[i], v.item(), box) for v, i in zip(values, indices)]
 
-    def predict_video(self, frames, clip_len=16, stride=8):
+    def predict_video(self, source, clip_len=16, stride=8):
         """
-        Slide a window over a long video and return predictions per window.
+        Slide a window over a video and return predictions per window.
+
+        Only the frames for each window are decoded, so long videos don't
+        need to fit in memory.
 
         Args:
-            frames: uint8 tensor of shape (T, H, W, C) for the whole video.
+            source: path to a video file, or an existing VideoDecoder.
             clip_len: number of frames per window.
             stride: step between window starts.
 
         Returns:
             List of (start_frame, top_predictions) tuples.
         """
-        results = []
-        total = frames.shape[0]
-        for start in range(0, max(total - clip_len + 1, 1), stride):
-            window = frames[start:start + clip_len]
-            results.append((start, self.predict(window)))
-        return results
+        decoder = source if isinstance(source, VideoDecoder) else VideoDecoder(source)
+        total = decoder.metadata.num_frames
 
-    @staticmethod
-    def _to_tchw(clip):
-        # The torchvision Kinetics preset expects (T, C, H, W) frames.
-        if clip.ndim != 4:
-            raise ValueError(f"Expected 4D clip tensor, got shape {tuple(clip.shape)}")
-        if clip.shape[-1] == 3:  # (T, H, W, C) -> (T, C, H, W)
-            clip = clip.permute(0, 3, 1, 2)
-        elif clip.shape[0] == 3:  # (C, T, H, W) -> (T, C, H, W)
-            clip = clip.permute(1, 0, 2, 3)
-        return clip
+        results = []
+        for start in range(0, max(total - clip_len + 1, 1), stride):
+            stop = min(start + clip_len, total)
+            frames = decoder.get_frames_in_range(start, stop).data  # (T, C, H, W)
+            results.append((start, self.predict(frames)))
+        return results
 
 
 if __name__ == "__main__":
-    import torchvision.io as io
-
-    # Load a video: returns (T, H, W, C) uint8 frames.
-    video, _, _ = io.read_video("example.mp4", pts_unit="sec")
-
+    decoder = VideoDecoder("assets/rally_women.mp4")
     recognizer = ActionRecognizer(top_k=3)
 
     # Classify the first 16 frames
-    for label, prob in recognizer.predict(video[:16]):
-        print(f"{label}: {prob:.3f}")
+    first_clip = decoder.get_frames_in_range(0, 16).data
+    os.makedirs("assets/output", exist_ok=True)
+    for i, (label, prob, box) in enumerate(recognizer.predict(first_clip)):
+        text = f"{label}:{prob:.3f}"
+        print(text)
+        # Save the clip frame matching this prediction's rank, named after the printed line.
+        image = first_clip[i]
+        if box is not None:
+            image = draw_bounding_boxes(
+                image, torch.tensor([box]), labels=[text], colors="red", width=3
+            )
+        write_png(image, f"assets/output/{text}.png")
 
-    # Or scan the whole video
-    for start, preds in recognizer.predict_video(video, clip_len=16, stride=16):
-        top_label, top_prob = preds[0]
-        print(f"frames {start}-{start + 16}: {top_label} ({top_prob:.2f})")
+    # # Or scan the whole video
+    # for start, preds in recognizer.predict_video(decoder, clip_len=16, stride=16):
+    #     top_label, top_prob, _ = preds[0]
+    #     print(f"frames {start}-{start + 16}: {top_label} ({top_prob:.2f})")
